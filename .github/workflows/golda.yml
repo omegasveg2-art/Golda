@@ -1,0 +1,334 @@
+name: golda
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: android sdk
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-33" "build-tools;33.0.2"
+      - name: write sources + build GoldaVisuals
+        run: |
+          mkdir -p golda_src/java/golda
+          cd golda_src
+          cat > AndroidManifest.xml <<'GOLDA_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="wawer.golda">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <application android:label="GoldaVisuals" android:allowBackup="false">
+                  <activity android:name="golda.Main" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name="golda.VisualsService" android:exported="false"/>
+              </application>
+          </manifest>
+          GOLDA_EOF
+          cat > build_golda.sh <<'GOLDA_EOF'
+          #!/bin/sh
+          # needs: JDK, ANDROID_HOME with build-tools + a platform. out: GoldaVisuals.apk
+          set -e
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          AJ=$(ls -d "$ANDROID_HOME"/platforms/android-* | sort -V | tail -1)/android.jar
+          D=build_golda
+          rm -rf $D && mkdir -p $D/classes
+          "$BT/aapt2" link -o $D/base.apk -I "$AJ" --manifest AndroidManifest.xml --min-sdk-version 26 --target-sdk-version 33 --version-code 1 --version-name 1
+          javac -encoding UTF-8 -source 8 -target 8 -Xlint:-options -cp "$AJ" -d $D/classes $(find java -name '*.java')
+          "$BT/d8" --release --min-api 26 --lib "$AJ" --output $D $(find $D/classes -name '*.class')
+          (cd $D && zip -q base.apk classes.dex)
+          "$BT/zipalign" -f -p 4 $D/base.apk $D/aligned.apk
+          keytool -genkeypair -keystore $D/dbg.jks -storepass android -keypass android -alias k -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=golda" >/dev/null 2>&1
+          "$BT/apksigner" sign --ks $D/dbg.jks --ks-pass pass:android --key-pass pass:android --out GoldaVisuals.apk $D/aligned.apk
+          echo "ok -> GoldaVisuals.apk"
+          GOLDA_EOF
+          cat > java/golda/Main.java <<'GOLDA_EOF'
+          package golda;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.provider.Settings;
+          import android.view.Gravity;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          public class Main extends Activity {
+              @Override protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL); root.setGravity(Gravity.CENTER);
+                  root.setBackgroundColor(0xFF0D0D14);
+                  int p = Ui.dp(this, 24); root.setPadding(p, p, p, p);
+
+                  TextView t = new TextView(this); t.setText("GoldaVisuals"); t.setTextColor(Ui.GOLD); t.setTextSize(30); t.setTypeface(Typeface.DEFAULT_BOLD); t.setGravity(Gravity.CENTER);
+                  TextView s = new TextView(this);
+                  s.setText("Красивые эффекты поверх игры: снег, кометы, северное сияние, звёзды, сакура, светлячки.\n\nНичего не читает из игры и не даёт преимуществ — только визуал.\n\n1) Запусти\n2) Открой игру\n3) Тапни золотую «G» и включи что нравится");
+                  s.setTextColor(Ui.DIM); s.setTextSize(14); s.setGravity(Gravity.CENTER); s.setPadding(0, p / 2, 0, p);
+                  Button go = new Button(this); go.setText("ЗАПУСТИТЬ"); go.setTextColor(0xFF1A1405); go.setBackground(Ui.round(Ui.GOLD, Ui.dp(this, 14), 0, 0));
+                  Button stop = new Button(this); stop.setText("Остановить"); stop.setTextColor(Ui.TEXT); stop.setBackground(Ui.round(Ui.CARD, Ui.dp(this, 14), 0, 0));
+                  root.addView(t); root.addView(s);
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, Ui.dp(this, 52)); lp.bottomMargin = Ui.dp(this, 10);
+                  root.addView(go, lp); root.addView(stop, new LinearLayout.LayoutParams(-1, Ui.dp(this, 52)));
+                  setContentView(root);
+
+                  go.setOnClickListener(v -> {
+                      if (Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(this)) {
+                          Toast.makeText(this, "Разреши «поверх других окон» и нажми ещё раз", Toast.LENGTH_LONG).show();
+                          startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + getPackageName())));
+                          return;
+                      }
+                      if (Build.VERSION.SDK_INT >= 33) requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1);
+                      startForegroundService(new Intent(this, VisualsService.class));
+                      Toast.makeText(this, "Запущено — ищи золотую G", Toast.LENGTH_SHORT).show();
+                  });
+                  stop.setOnClickListener(v -> stopService(new Intent(this, VisualsService.class)));
+              }
+          }
+          GOLDA_EOF
+          cat > java/golda/VisualsService.java <<'GOLDA_EOF'
+          package golda;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.Service;
+          import android.content.Intent;
+          import android.graphics.Canvas;
+          import android.graphics.Color;
+          import android.graphics.Paint;
+          import android.graphics.PixelFormat;
+          import android.graphics.Typeface;
+          import android.os.IBinder;
+          import android.util.DisplayMetrics;
+          import android.view.Gravity;
+          import android.view.MotionEvent;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+
+          /** Overlay host: (1) click-through effects layer over the game, (2) draggable gold bubble, (3) settings menu. Visuals only. */
+          public class VisualsService extends Service {
+              private WindowManager wm;
+              private FxView fx;
+              private View bubble, menu;
+              private WindowManager.LayoutParams bubLp, menuLp;
+
+              @Override public IBinder onBind(Intent i) { return null; }
+
+              @Override public int onStartCommand(Intent i, int f, int id) {
+                  startForeground(1, notif());
+                  if (fx == null) setup();
+                  return START_STICKY;
+              }
+
+              private Notification notif() {
+                  NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+                  nm.createNotificationChannel(new NotificationChannel("golda", "GoldaVisuals", NotificationManager.IMPORTANCE_LOW));
+                  return new Notification.Builder(this, "golda").setContentTitle("GoldaVisuals").setContentText("эффекты запущены")
+                          .setSmallIcon(android.R.drawable.btn_star_big_on).build();
+              }
+
+              private WindowManager.LayoutParams lp(int w, int h, int flags) {
+                  return new WindowManager.LayoutParams(w, h, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, flags, PixelFormat.TRANSLUCENT);
+              }
+
+              private void setup() {
+                  Prefs.init(this);
+                  wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+
+                  // effects layer: never takes touches, game stays fully playable
+                  fx = new FxView(this);
+                  WindowManager.LayoutParams fl = lp(-1, -1, WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                          | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS | WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED);
+                  fl.gravity = Gravity.TOP | Gravity.START;
+                  wm.addView(fx, fl);
+                  Prefs.listener = () -> { if (fx != null) fx.invalidate(); };
+                  fx.invalidate();
+
+                  // bubble
+                  final int sz = Ui.dp(this, 46);
+                  bubble = new View(this) {
+                      final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+                      @Override protected void onDraw(Canvas c) {
+                          float r = getWidth() / 2f;
+                          p.setColor(0x44E6B450); c.drawCircle(r, r, r, p);
+                          p.setColor(0xFF15151D); c.drawCircle(r, r, r * 0.82f, p);
+                          p.setColor(Ui.GOLD); p.setStyle(Paint.Style.STROKE); p.setStrokeWidth(r * 0.1f); c.drawCircle(r, r, r * 0.82f, p);
+                          p.setStyle(Paint.Style.FILL); p.setTextAlign(Paint.Align.CENTER); p.setTypeface(Typeface.DEFAULT_BOLD); p.setTextSize(r * 1.05f);
+                          c.drawText("G", r, r + r * 0.37f, p);
+                      }
+                  };
+                  bubLp = lp(sz, sz, WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS);
+                  bubLp.gravity = Gravity.TOP | Gravity.START; bubLp.x = Ui.dp(this, 10); bubLp.y = Ui.dp(this, 90);
+                  bubble.setOnTouchListener(new View.OnTouchListener() {
+                      float dx, dy; int sx, sy; boolean drag;
+                      @Override public boolean onTouch(View v, MotionEvent e) {
+                          switch (e.getActionMasked()) {
+                              case MotionEvent.ACTION_DOWN: dx = e.getRawX(); dy = e.getRawY(); sx = bubLp.x; sy = bubLp.y; drag = false; return true;
+                              case MotionEvent.ACTION_MOVE:
+                                  if (Math.abs(e.getRawX() - dx) + Math.abs(e.getRawY() - dy) > Ui.dp(VisualsService.this, 8)) drag = true;
+                                  if (drag) { bubLp.x = sx + (int) (e.getRawX() - dx); bubLp.y = sy + (int) (e.getRawY() - dy); wm.updateViewLayout(bubble, bubLp); }
+                                  return true;
+                              case MotionEvent.ACTION_UP: if (!drag) toggleMenu(); return true;
+                              default: return true;
+                          }
+                      }
+                  });
+                  wm.addView(bubble, bubLp);
+              }
+
+              private void toggleMenu() {
+                  if (menu != null) { try { wm.removeView(menu); } catch (Exception ignored) { } menu = null; return; }
+                  menu = buildMenu();
+                  DisplayMetrics dm = getResources().getDisplayMetrics();
+                  int w, h;
+                  if (dm.widthPixels > dm.heightPixels) { w = Math.min(Ui.dp(this, 520), (int) (dm.widthPixels * 0.62f)); h = Math.min(Ui.dp(this, 360), (int) (dm.heightPixels * 0.88f)); }
+                  else { w = (int) (dm.widthPixels * 0.94f); h = (int) (dm.heightPixels * 0.62f); }
+                  menuLp = lp(w, h, WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE);
+                  menuLp.gravity = Gravity.TOP | Gravity.START; menuLp.x = (dm.widthPixels - w) / 2; menuLp.y = (dm.heightPixels - h) / 2;
+                  wm.addView(menu, menuLp);
+              }
+
+              private View buildMenu() {
+                  final int p8 = Ui.dp(this, 8), p12 = Ui.dp(this, 12);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setBackground(Ui.round(Ui.BG, Ui.dp(this, 18), 0x66E6B450, Ui.dp(this, 1)));
+
+                  // header = drag handle
+                  LinearLayout head = new LinearLayout(this);
+                  head.setOrientation(LinearLayout.HORIZONTAL); head.setGravity(Gravity.CENTER_VERTICAL);
+                  head.setPadding(p12 + p8, p12, p12, p8);
+                  LinearLayout titles = new LinearLayout(this); titles.setOrientation(LinearLayout.VERTICAL);
+                  TextView t = new TextView(this); t.setText("GoldaVisuals"); t.setTextColor(Ui.GOLD); t.setTextSize(18); t.setTypeface(Typeface.DEFAULT_BOLD);
+                  TextView st = new TextView(this); st.setText("только визуальные эффекты · тащи за шапку"); st.setTextColor(Ui.DIM); st.setTextSize(11);
+                  titles.addView(t); titles.addView(st);
+                  head.addView(titles, new LinearLayout.LayoutParams(0, -2, 1));
+                  TextView x = new TextView(this); x.setText("✕"); x.setTextColor(Ui.TEXT); x.setTextSize(18); x.setPadding(p12, 0, p12, 0);
+                  x.setOnClickListener(v -> toggleMenu());
+                  head.addView(x);
+                  head.setOnTouchListener(new View.OnTouchListener() {
+                      float dx, dy; int sx, sy;
+                      @Override public boolean onTouch(View v, MotionEvent e) {
+                          if (menuLp == null || menu == null) return false;
+                          switch (e.getActionMasked()) {
+                              case MotionEvent.ACTION_DOWN: dx = e.getRawX(); dy = e.getRawY(); sx = menuLp.x; sy = menuLp.y; return true;
+                              case MotionEvent.ACTION_MOVE: menuLp.x = sx + (int) (e.getRawX() - dx); menuLp.y = sy + (int) (e.getRawY() - dy); wm.updateViewLayout(menu, menuLp); return true;
+                              default: return true;
+                          }
+                      }
+                  });
+                  root.addView(head);
+
+                  ScrollView sv = new ScrollView(this);
+                  sv.setVerticalScrollBarEnabled(false);
+                  LinearLayout list = new LinearLayout(this);
+                  list.setOrientation(LinearLayout.VERTICAL); list.setPadding(p12, 0, p12, p12);
+                  for (final Effect e : fx.fx) {
+                      LinearLayout card = new LinearLayout(this);
+                      card.setOrientation(LinearLayout.VERTICAL); card.setPadding(p12, p12, p12, p8);
+                      card.setBackground(Ui.round(Ui.CARD, Ui.dp(this, 14), 0, 0));
+                      LinearLayout row = new LinearLayout(this); row.setGravity(Gravity.CENTER_VERTICAL);
+                      TextView tt = new TextView(this); tt.setText(e.title); tt.setTextColor(Ui.TEXT); tt.setTextSize(15); tt.setTypeface(Typeface.DEFAULT_BOLD);
+                      row.addView(tt, new LinearLayout.LayoutParams(0, -2, 1));
+                      row.addView(new Ui.Toggle(this, e.on(), v -> Prefs.set(e.key + ".on", v)));
+                      card.addView(row);
+                      card.addView(new Ui.Slider(this, "Количество", Prefs.i(e.key + ".dens"), v -> Prefs.set(e.key + ".dens", v)));
+                      card.addView(new Ui.Slider(this, "Скорость", Prefs.i(e.key + ".speed"), v -> Prefs.set(e.key + ".speed", v)));
+                      LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(-1, -2); clp.bottomMargin = p8;
+                      list.addView(card, clp);
+                  }
+                  LinearLayout g = new LinearLayout(this);
+                  g.setOrientation(LinearLayout.VERTICAL); g.setPadding(p12, p12, p12, p8);
+                  g.setBackground(Ui.round(Ui.CARD, Ui.dp(this, 14), 0, 0));
+                  TextView gt = new TextView(this); gt.setText("Общее"); gt.setTextColor(Ui.TEXT); gt.setTextSize(15); gt.setTypeface(Typeface.DEFAULT_BOLD);
+                  g.addView(gt);
+                  g.addView(new Ui.Slider(this, "Прозрачность эффектов", Prefs.i("global.alpha"), v -> Prefs.set("global.alpha", v)));
+                  list.addView(g, new LinearLayout.LayoutParams(-1, -2));
+                  sv.addView(list);
+                  root.addView(sv, new LinearLayout.LayoutParams(-1, 0, 1));
+                  return root;
+              }
+
+              @Override public void onDestroy() {
+                  Prefs.listener = null;
+                  for (View v : new View[]{menu, bubble, fx}) if (v != null) { try { wm.removeView(v); } catch (Exception ignored) { } }
+                  menu = null; bubble = null; fx = null;
+                  super.onDestroy();
+              }
+          }
+          GOLDA_EOF
+          cat > java/golda/FxView.java <<'GOLDA_EOF'
+          package golda;
+
+          import android.content.Context;
+          import android.graphics.Canvas;
+          import android.graphics.Paint;
+          import android.view.View;
+
+          /** full-screen transparent canvas running the enabled effects. Draw loop only runs while at least one effect is on. */
+          class FxView extends View {
+              final Effect[] fx = { new AuroraEffect(), new StarsEffect(), new CometEffect(), new SnowEffect(), new PetalsEffect(), new FirefliesEffect() };
+              private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+              private long last;
+
+              FxView(Context c) { super(c); setWillNotDraw(false); }
+
+              @Override protected void onSizeChanged(int w, int h, int ow, int oh) {
+                  float d = getResources().getDisplayMetrics().density;
+                  for (Effect e : fx) e.resize(w, h, d);
+              }
+
+              @Override protected void onDraw(Canvas c) {
+                  long now = System.nanoTime();
+                  float dt = last == 0 ? 0.016f : Math.min(0.05f, (now - last) / 1e9f);
+                  last = now;
+                  float ga = Prefs.i("global.alpha") / 100f;
+                  boolean any = false;
+                  for (Effect e : fx) if (e.on()) { e.update(dt); e.draw(c, p, ga); any = true; }
+                  if (any) postInvalidateOnAnimation(); else last = 0;
+              }
+          }
+          GOLDA_EOF
+          cat > java/golda/Effects.java <<'GOLDA_EOF'
+          package golda;
+
+          import android.graphics.Canvas;
+          import android.graphics.LinearGradient;
+          import android.graphics.Matrix;
+          import android.graphics.Paint;
+          import android.graphics.RectF;
+          import android.graphics.Shader;
+          import java.util.Random;
+
+          /** Pure cosmetic particle effects drawn on a transparent overlay. Nothing here reads or touches the game. */
+          abstract class Effect {
+              final String key, title;
+              float W, H, D, af = 1f;
+              final Random rnd = new Random();
+              Effect(String key, String title) { this.key = key; this.title = title; }
+              boolean on() { return Prefs.b(key + ".on"); }
+              float dens() { return Prefs.i(key + ".dens") / 100f; }
+              float speed() { return 0.25f + Prefs.i(key + ".speed") / 100f * 1.75f; }   // 0.25x .. 2x
+              void resize(float w, float h, float d) { W = w; H = h; D = d; af = Math.max(0.5f, Math.min(2f, w * h / 2.6e6f)); onResize(); 
